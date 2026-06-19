@@ -171,6 +171,59 @@ class ImageObservation:
     confidence: float = 0.0
 
 
+@dataclass
+class EvidenceRequirement:
+    """A single row from evidence_requirements.csv."""
+    requirement_id: str
+    claim_object: str
+    applies_to: str
+    minimum_image_evidence: str
+
+
+@dataclass
+class CrossImageAggregation:
+    """Aggregated cross-image evidence computed before adjudication."""
+    conflicting_evidence: bool = False
+    partial_support: bool = False
+    object_consistent: bool = True
+    part_consistent: bool = True
+    max_confidence: float = 0.0
+    avg_confidence: float = 0.0
+    supporting_confidence: float = 0.0
+    aggregated_issues: list[str] = field(default_factory=list)
+    aggregated_parts: list[str] = field(default_factory=list)
+    image_count: int = 0
+    valid_image_count: int = 0
+
+
+@dataclass
+class MatchedRequirement:
+    """An evidence requirement matched against actual image evidence."""
+    requirement_id: str
+    text: str
+    met: bool
+    reason: str
+
+
+# Maps requirement_id -> (set of issue_types that trigger matching)
+REQUIREMENT_ISSUE_MAP: dict[str, set[str]] = {
+    "REQ_CAR_BODY_PANEL": {"dent", "scratch"},
+    "REQ_CAR_GLASS_LIGHT_MIRROR": {"crack", "broken_part", "missing_part", "glass_shatter"},
+    "REQ_LAPTOP_SCREEN_KEYBOARD_TRACKPAD": set(),  # matched by part, not issue
+    "REQ_LAPTOP_BODY_HINGE_PORT": set(),  # matched by part, not issue
+    "REQ_PACKAGE_EXTERIOR": {"crushed_packaging", "torn_packaging"},
+    "REQ_PACKAGE_LABEL_OR_STAIN": {"water_damage", "stain"},
+    "REQ_PACKAGE_CONTENTS": set(),  # matched by part, not issue
+}
+
+# Maps requirement_id -> (set of object_parts that trigger matching)
+REQUIREMENT_PART_MAP: dict[str, set[str]] = {
+    "REQ_LAPTOP_SCREEN_KEYBOARD_TRACKPAD": {"screen", "keyboard", "trackpad"},
+    "REQ_LAPTOP_BODY_HINGE_PORT": {"hinge", "lid", "corner", "body", "base", "port"},
+    "REQ_PACKAGE_CONTENTS": {"contents", "item"},
+}
+
+
 def normalize_text(value: Any, default: str = "unknown") -> str:
     if value is None:
         return default

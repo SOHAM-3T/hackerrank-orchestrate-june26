@@ -98,3 +98,56 @@ class ModelClient:
                     time.sleep(1.5 * (attempt + 1))
 
         raise RuntimeError(f"Model call failed after retries: {last_error}") from last_error
+
+    def structured_text_json(
+        self,
+        task_name: str,
+        system_prompt: str,
+        user_prompt: str,
+        extra_cache_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Text-only structured JSON call with caching and retries."""
+        if self.is_heuristic:
+            return {}
+
+        self.require_ready()
+        cache_key = stable_hash(
+            {
+                "prompt_version": PROMPT_VERSION,
+                "model": self.model,
+                "task_name": task_name,
+                "system_prompt": system_prompt,
+                "user_prompt": user_prompt,
+                "extra": extra_cache_payload,
+            }
+        )
+        cache_path = self.cache_dir / "model_responses" / f"{cache_key}.json"
+        cached = load_json(cache_path)
+        if cached is not None:
+            return cached
+
+        from openai import OpenAI
+
+        client = OpenAI()
+        last_error: Exception | None = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = client.responses.create(
+                    model=self.model,
+                    temperature=self.temperature,
+                    input=[
+                        {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
+                        {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]},
+                    ],
+                    text={"format": {"type": "json_object"}},
+                )
+                text = response.output_text
+                payload = json.loads(text)
+                save_json(cache_path, payload)
+                return payload
+            except Exception as exc:
+                last_error = exc
+                if attempt < self.max_retries:
+                    time.sleep(1.5 * (attempt + 1))
+
+        raise RuntimeError(f"Text model call failed after retries: {last_error}") from last_error
