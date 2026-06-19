@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import sys
+from collections import Counter
 from pathlib import Path
 
 CODE_DIR = Path(__file__).resolve().parents[1]
@@ -12,7 +13,7 @@ if str(CODE_DIR) not in sys.path:
 
 from evidence_agent.model_client import MissingModelKeyError
 from evidence_agent.pipeline import EvidencePipeline, run_pipeline
-from evidence_agent.schema import OUTPUT_COLUMNS, split_flags
+from evidence_agent.schema import CLAIM_STATUSES, ISSUE_TYPES, OUTPUT_COLUMNS, SEVERITIES, split_flags
 
 
 METRIC_FIELDS = [
@@ -88,6 +89,117 @@ def metric_table(expected: list[dict[str, str]], actual: list[dict[str, str]]) -
     return "\n".join(f"| `{field}` | {accuracy(expected, actual, field):.3f} |" for field in METRIC_FIELDS)
 
 
+# ──────────────────────────────────────────────────────────────
+# New evaluation helpers
+# ──────────────────────────────────────────────────────────────
+
+
+def confusion_matrix_md(
+    expected: list[dict[str, str]],
+    actual: list[dict[str, str]],
+    field: str,
+    labels: list[str] | None = None,
+) -> str:
+    """Build a markdown confusion matrix table for a given field."""
+    if labels is None:
+        all_values = sorted({row.get(field, "?") for row in expected + actual})
+    else:
+        all_values = labels
+
+    # Count (expected, predicted) pairs
+    counts: dict[tuple[str, str], int] = Counter()
+    for exp, pred in zip(expected, actual):
+        e_val = exp.get(field, "?")
+        p_val = pred.get(field, "?")
+        counts[(e_val, p_val)] += 1
+
+    # Header
+    header = f"| Expected \\ Predicted | " + " | ".join(f"`{v}`" for v in all_values) + " |"
+    sep = "|---|" + "|".join("---:" for _ in all_values) + "|"
+    rows = []
+    for e in all_values:
+        cells = [str(counts.get((e, p), 0)) for p in all_values]
+        rows.append(f"| `{e}` | " + " | ".join(cells) + " |")
+
+    return "\n".join([header, sep] + rows)
+
+
+def per_class_accuracy(
+    expected: list[dict[str, str]],
+    actual: list[dict[str, str]],
+    field: str,
+) -> dict[str, tuple[int, int, float]]:
+    """Returns {class_label: (correct, total, accuracy)} for each class in expected."""
+    class_counts: dict[str, list[int]] = {}  # label -> [correct, total]
+    for exp, pred in zip(expected, actual):
+        label = exp.get(field, "?")
+        if label not in class_counts:
+            class_counts[label] = [0, 0]
+        class_counts[label][1] += 1
+        if pred.get(field) == label:
+            class_counts[label][0] += 1
+    return {
+        label: (correct, total, correct / total if total else 0.0)
+        for label, (correct, total) in sorted(class_counts.items())
+    }
+
+
+def per_class_table(
+    expected: list[dict[str, str]],
+    actual: list[dict[str, str]],
+    field: str,
+) -> str:
+    """Markdown table showing per-class accuracy for a field."""
+    classes = per_class_accuracy(expected, actual, field)
+    header = "| Class | Correct | Total | Accuracy |"
+    sep = "|---|---:|---:|---:|"
+    rows = [
+        f"| `{label}` | {correct} | {total} | {acc:.3f} |"
+        for label, (correct, total, acc) in classes.items()
+    ]
+    return "\n".join([header, sep] + rows)
+
+
+def per_object_metrics(
+    expected: list[dict[str, str]],
+    actual: list[dict[str, str]],
+) -> str:
+    """Per-object-type (car/laptop/package) accuracy breakdown."""
+    objects = sorted({row.get("claim_object", "?") for row in expected})
+    sections = []
+    for obj in objects:
+        exp_subset = [e for e in expected if e.get("claim_object") == obj]
+        pred_subset = [p for e, p in zip(expected, actual) if e.get("claim_object") == obj]
+        if not exp_subset:
+            continue
+        lines = [f"#### `{obj}` ({len(exp_subset)} claims)"]
+        lines.append("")
+        lines.append("| Field | Accuracy |")
+        lines.append("|---|---:|")
+        for field in METRIC_FIELDS:
+            acc = accuracy(exp_subset, pred_subset, field)
+            lines.append(f"| `{field}` | {acc:.3f} |")
+        sections.append("\n".join(lines))
+    return "\n\n".join(sections)
+
+
+def exact_match_pct(expected: list[dict[str, str]], actual: list[dict[str, str]]) -> float:
+    """Percentage of rows where all metric fields match exactly."""
+    if not expected:
+        return 0.0
+    exact = sum(
+        1
+        for exp, pred in zip(expected, actual)
+        if all(exp.get(f) == pred.get(f) for f in METRIC_FIELDS)
+    )
+    return exact / len(expected)
+
+
+# ──────────────────────────────────────────────────────────────
+# Report generation
+# ──────────────────────────────────────────────────────────────
+
+
 def write_report(
     report_path: Path,
     mode: str,
@@ -108,6 +220,27 @@ def write_report(
         for exp, pred in zip(expected, actual)
         if all(exp.get(field) == pred.get(field) for field in METRIC_FIELDS)
     )
+    exact_pct = exact_match_pct(expected, actual)
+
+    # New metrics
+    cm_status = confusion_matrix_md(expected, actual, "claim_status", sorted(CLAIM_STATUSES))
+    cm_issue = confusion_matrix_md(expected, actual, "issue_type")
+    cm_severity = confusion_matrix_md(expected, actual, "severity", sorted(SEVERITIES))
+
+    pc_status = per_class_table(expected, actual, "claim_status")
+    pc_issue = per_class_table(expected, actual, "issue_type")
+    pc_severity = per_class_table(expected, actual, "severity")
+
+    per_obj = per_object_metrics(expected, actual)
+
+    # Requirement coverage: count predictions that mention REQ_ in justifications
+    req_coverage_count = sum(
+        1 for row in actual
+        if "REQ_" in row.get("evidence_standard_met_reason", "")
+        or "REQ_" in row.get("claim_status_justification", "")
+    )
+    req_coverage_pct = req_coverage_count / len(actual) if actual else 0.0
+
     report_path.write_text(
         f"""# Evaluation Report
 
@@ -117,7 +250,7 @@ def write_report(
 - Sample claims: {len(expected)}
 - Sample images: {image_count}
 - Prediction file: `{output_path}`
-- Exact metric-field row matches: {exact_rows}/{len(expected)}
+- Exact metric-field row matches: {exact_rows}/{len(expected)} ({exact_pct:.1%})
 - Invalid schema rows: {invalid_rows}
 - Missing required fields: {missing_fields}
 
@@ -130,6 +263,43 @@ def write_report(
 Risk flag precision: {precision:.3f}
 Risk flag recall: {recall:.3f}
 Risk flag F1-style score: {f1:.3f}
+
+## Confusion Matrices
+
+### `claim_status`
+
+{cm_status}
+
+### `issue_type`
+
+{cm_issue}
+
+### `severity`
+
+{cm_severity}
+
+## Per-Class Accuracy
+
+### `claim_status`
+
+{pc_status}
+
+### `issue_type`
+
+{pc_issue}
+
+### `severity`
+
+{pc_severity}
+
+## Per-Object-Type Breakdown
+
+{per_obj}
+
+## Exact Match & Requirement Coverage
+
+- Exact match rate (all 6 metric fields correct): **{exact_pct:.1%}**
+- Predictions referencing evidence requirements: {req_coverage_count}/{len(actual)} ({req_coverage_pct:.1%})
 
 ## Strategy Comparison
 
@@ -149,17 +319,19 @@ Baseline risk flag F1-style score: {baseline_f1:.3f}
 
 ### Strategy B: Final staged pipeline
 
-The implemented pipeline separates claim parsing, per-image evidence extraction,
-adjudication, and schema guarding. This is more explainable, supports bounded
+The implemented pipeline separates claim parsing (LLM + rule fallback), per-image
+evidence extraction, cross-image aggregation, confidence-aware adjudication with
+requirement matching, and schema guarding. This is more explainable, supports bounded
 parallel image review, keeps output deterministic, and gives the judge a clearer
-story about how visual evidence, evidence requirements, and user history interact.
+story about how visual evidence, evidence requirements, confidence, and user history
+interact.
 
 ## Operational Analysis
 
 - Final test set: 44 claims and 82 images.
-- Model calls in OpenAI mode: approximately one vision call per image, so about 82 calls for the test set and {image_count} for the sample set.
-- Token usage: claim text plus compact JSON instructions per image; image-token accounting depends on provider detail settings and image dimensions.
-- Cost: estimate with the selected model's current image and text pricing before submission.
+- Model calls in OpenAI mode: approximately one vision call per image plus one text call per claim for LLM claim parsing, so about 82 + 44 = 126 calls for the test set and {image_count} + {len(expected)} = {image_count + len(expected)} for the sample set.
+- Token usage: claim text plus compact JSON instructions per image; image-token accounting depends on provider detail settings and image dimensions. LLM claim parsing uses ~200 input tokens per call.
+- Cost: estimate with the selected model's current image and text pricing before submission. Text-only claim parsing adds negligible cost (~$0.01 total).
 - Runtime: bounded by image upload/model latency; default concurrency is `MAX_CONCURRENT_CLAIMS=2` and `MAX_CONCURRENT_IMAGES=4`.
 - Rate limits: lower concurrency if requests-per-minute or tokens-per-minute errors appear.
 - Caching: responses are cached by prompt version, model name, row payload, and image metadata under `.cache/evidence_agent/`.
