@@ -2,6 +2,6 @@ pandas
 pillow
 pillow-avif-plugin
 python-dotenv
-openai
+google-genai
 pydantic
 tqdm
