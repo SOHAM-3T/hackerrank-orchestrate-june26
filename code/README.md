@@ -72,14 +72,33 @@ The evaluation report includes:
 
 ## Architecture
 
-The agent has six stages:
+The agent has six stages (see `code/evidence_agent/pipeline.py:EvidencePipeline.process_row`).
 
-1. **Claim Parser**: Extracts issue type, object part, severity, constraints, and adversarial text. Uses LLM structured extraction with rule-based fallback when the API is unavailable or extraction fails.
-2. **Image Evidence Extractor**: Normalizes image formats and inspects each image independently using a vision-language model (VLM).
-3. **Cross-Image Aggregator**: Aggregates all per-image observations before adjudication. Detects conflicting evidence, partial support, object/part consistency, and computes confidence statistics (max, avg, supporting).
-4. **Evidence Requirements Matcher**: Loads `evidence_requirements.csv` and matches applicable requirements to the claim by object type, issue family, and part. Evaluates whether each requirement is satisfied by the image evidence.
-5. **Confidence-Aware Adjudicator**: Compares image observations, cross-image aggregation, matched requirements, user history, and confidence statistics to determine `claim_status`, `evidence_standard_met`, risk flags, and justifications. Low-confidence evidence triggers `manual_review_required` flags.
-6. **Schema Guardian**: Validates allowed values, column order, booleans, flags, and supporting image IDs against the output schema.
+1. **Claim Parser (`parse_claim`)**: Creates structured fields (`issue_type`, `object_part`, `severity_hint`, `constraints`, `adversarial_text`) from `user_claim`.
+   - Uses a text-only structured JSON call when `EVIDENCE_AGENT_MODE` is not `heuristic`.
+   - Falls back to keyword/rule extraction (`rule_parse_claim`) if the model is unavailable or returns unknowns.
+   - Independently flags prompt-injection style phrases via `INJECTION_PATTERNS`.
+2. **Image Evidence Extractor (`extract_image_evidence`)**: For each `image_paths` entry, normalizes/converts the image into a provider-safe cached format and inspects that single image.
+   - If `heuristic` mode (or normalization fails), produces a conservative schema-valid observation without pixel understanding.
+   - Otherwise, uses a vision structured JSON call to extract visible object/parts, issue type/part, severity, `risk_flags`, an image-grounded description, and a numeric confidence.
+3. **Cross-Image Aggregation (`aggregate_evidence`)**: Combines all per-image observations to compute:
+   - consistency signals (object/part consistency)
+   - conflict signals
+   - confidence statistics (`max_confidence`, `avg_confidence`, and “supporting-evidence” confidence)
+4. **Evidence Requirements Matching (`match_requirements`)**: Loads `dataset/evidence_requirements.csv` and selects which requirements apply to the claim.
+   - Requirements are filtered by `claim_object` and mapped applicability by `issue_type` and/or `object_part`.
+   - Each matched requirement is evaluated as met/unmet with a short reason.
+5. **Confidence-Aware Adjudication (`adjudicate`)**: Produces final decision fields using:
+   - user history risk flags (`dataset/user_history.csv`)
+   - cross-image aggregation (conflicts + confidence)
+   - per-image risk flags
+   - requirement-matching results
+   - confidence thresholding (`CONFIDENCE_THRESHOLD`, default `0.4`)
+   - Final `claim_status` logic:
+     - `not_enough_information` if evidence standard is not met
+     - `supported` if evidence is met and supporting images exist (with a possible downgrade for very low supporting confidence)
+     - `contradicted` when evidence exists but mismatches are detected (e.g., wrong part/object)
+6. **Schema Guardian (`guardian`)**: Coerces/validates output fields against allowed enums, cleans justification text, filters `supporting_image_ids` to those actually present, and enforces `supporting_image_ids=none` for `not_enough_information`.
 
 ```
 Claim Parsing (LLM + rules)
@@ -95,16 +114,19 @@ Execution is sequential inside each claim and parallel only for independent imag
 ## Key Features
 
 ### LLM Claim Parsing
+
 - Structured JSON extraction from multilingual claim conversations
 - Falls back to keyword-based rules if LLM is unavailable
 - Detects adversarial injection patterns in both LLM and rule paths
 
 ### Cross-Image Reasoning
+
 - Detects when multiple images conflict on issue type or visible object
 - Identifies partial support (some images match, others don't)
 - Tracks object and part consistency across all images in a claim
 
 ### Confidence-Aware Decisions
+
 - Uses per-image confidence from VLM responses
 - Computes max, average, and supporting-evidence confidence
 - Configurable threshold (`CONFIDENCE_THRESHOLD`, default 0.4)
@@ -112,6 +134,7 @@ Execution is sequential inside each claim and parallel only for independent imag
 - Very low confidence can downgrade `supported` to `not_enough_information`
 
 ### Explicit Requirement Matching
+
 - Loads all 12 requirements from `evidence_requirements.csv`
 - Matches by claim object, issue type, and object part
 - Each matched requirement is evaluated (met/unmet with reason)
@@ -119,21 +142,23 @@ Execution is sequential inside each claim and parallel only for independent imag
 - Unmet requirements are cited in `claim_status_justification`
 
 ### Rich Explainability
+
 - Justifications reference specific image IDs, confidence scores, cross-image consistency, user history summaries, and matched requirement IDs
 - All explanations are capped at 450 characters for output compatibility
 
 ## Environment Variables
 
-| Variable | Default | Description |
-|---|---|---|
-| `OPENAI_API_KEY` | — | Required for OpenAI mode |
-| `MODEL_NAME` | `gpt-4.1-mini` | Vision-language model to use |
-| `EVIDENCE_AGENT_MODE` | `openai` | `openai` or `heuristic` |
-| `MAX_CONCURRENT_CLAIMS` | `2` | Parallel claim processing threads |
-| `MAX_CONCURRENT_IMAGES` | `4` | Parallel image processing threads per claim |
-| `TEMPERATURE` | `0` | Model temperature (0 for deterministic) |
-| `MAX_MODEL_RETRIES` | `2` | Retry attempts for failed API calls |
-| `CONFIDENCE_THRESHOLD` | `0.4` | Below this, adds `manual_review_required` |
+| Variable                | Default        | Description                                 |
+| ----------------------- | -------------- | ------------------------------------------- |
+| `OPENAI_API_KEY`        | —              | Required for OpenAI mode                    |
+| `GOOGLE_API_KEY`        | —              | Required for GEMINI mode                    |
+| `MODEL_NAME`            | `gpt-4.1-mini` | Vision-language model to use                |
+| `EVIDENCE_AGENT_MODE`   | `openai`       | `openai` or `heuristic`                     |
+| `MAX_CONCURRENT_CLAIMS` | `2`            | Parallel claim processing threads           |
+| `MAX_CONCURRENT_IMAGES` | `4`            | Parallel image processing threads per claim |
+| `TEMPERATURE`           | `0`            | Model temperature (0 for deterministic)     |
+| `MAX_MODEL_RETRIES`     | `2`            | Retry attempts for failed API calls         |
+| `CONFIDENCE_THRESHOLD`  | `0.4`          | Below this, adds `manual_review_required`   |
 
 ## Image Handling
 
