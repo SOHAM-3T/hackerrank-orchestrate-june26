@@ -84,7 +84,7 @@ class ModelClient:
             contents.append(types.Part.from_bytes(data=data, mime_type=mime))
 
         last_error: Exception | None = None
-        for attempt in range(self.max_retries + 1):
+        for attempt in range(20):
             try:
                 response = client.models.generate_content(
                     model=self.model,
@@ -103,8 +103,14 @@ class ModelClient:
                 return payload
             except Exception as exc:
                 last_error = exc
-                if attempt < self.max_retries:
-                    time.sleep(1.5 * (attempt + 1))
+                if "429" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc):
+                    print(f"Rate limit hit (vision), sleeping 60s...")
+                    time.sleep(60)
+                else:
+                    if attempt < self.max_retries:
+                        time.sleep(1.5 * (attempt + 1))
+                    else:
+                        break
 
         raise RuntimeError(f"Model call failed after retries: {last_error}") from last_error
 
@@ -140,7 +146,7 @@ class ModelClient:
 
         client = genai.Client()
         last_error: Exception | None = None
-        for attempt in range(self.max_retries + 1):
+        for attempt in range(20):
             try:
                 response = client.models.generate_content(
                     model=self.model,
@@ -159,7 +165,13 @@ class ModelClient:
                 return payload
             except Exception as exc:
                 last_error = exc
-                if attempt < self.max_retries:
-                    time.sleep(1.5 * (attempt + 1))
+                if "429" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc):
+                    print(f"Rate limit hit (text), sleeping 60s...")
+                    time.sleep(60)
+                else:
+                    if attempt < self.max_retries:
+                        time.sleep(1.5 * (attempt + 1))
+                    else:
+                        break
 
         raise RuntimeError(f"Text model call failed after retries: {last_error}") from last_error
